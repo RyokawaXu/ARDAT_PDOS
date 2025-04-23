@@ -9,7 +9,7 @@ Copy-paste from torch.nn.Transformer with modifications:
 """
 import copy
 from typing import Optional, List
-
+import math
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
@@ -53,7 +53,7 @@ class CNN(nn.Module):
 
             # 非最后一层添加GELU和Dropout
             if i < num_layers - 1:
-                self.layers.append(nn.ReLU())    # 替换ReLU
+                self.layers.append(nn.GELU())    # 替换ReLU
                 self.layers.append(nn.Dropout(0.1))  # 新增Dropout
 
     def forward(self, x):
@@ -61,6 +61,7 @@ class CNN(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x  # 输出形状: [B, output_dim, L]
+
 
 class Transformer(nn.Module):
 
@@ -87,16 +88,8 @@ class Transformer(nn.Module):
 
         self.query_embed = nn.Parameter(torch.zeros(dos_num, d_model))
         self.tgt = nn.Parameter(torch.zeros(dos_num, d_model))
-        self.tok_emb = nn.Embedding(token_num, d_model)
-        #新增：cross‑attention 层
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead,
-                                                dropout=dropout,
-                                                batch_first=True)
-        self.cross_norm1 = nn.LayerNorm(d_model)
-        self.cross_dropout1 = nn.Dropout(0.1)
-        self.cross_ffn = MLP(d_model, d_model, d_model, num_layers=2)
-        self.cross_norm2 = nn.LayerNorm(d_model)
-        self.cross_dropout2 = nn.Dropout(0.1)
+        self.tok_emb = nn.Embedding(token_num, d_model//2)
+        
         #self.out_embed = MLP(d_model, d_model, 1, 5)
         self.out_embed = CNN(d_model, d_model*3, output_dim=1, num_layers=4)
         #self.out_embed = nn.Sequential(
@@ -109,7 +102,7 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
 
-        self.atom_fea_encoder = AtomFeatureEncoder(3, d_model)
+        self.atom_fea_encoder = AtomFeatureEncoder(3, d_model//2)
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -125,53 +118,39 @@ class Transformer(nn.Module):
         """
         B = pos.shape[0]
         
-        #  提取晶格信息
+        # 1. 提取晶格信息
         lattice_params = pos[:, :2, :].reshape(B, 6)  # [B, 6]
         lattice = build_lattice_matrix(lattice_params)  # [B, 3, 3]
 
-        #  移除晶格 token，保留原子部分
+        # 2. 移除晶格 token，保留原子部分
         src = src[:, 2:]        # [B, L-2]：原子信息（去除晶格信息）
         pos = pos[:, 2:, :]  # [B, L-2, 3]：原子坐标（从分数坐标提取）
     
         mask = mask[:, 2:]      # [B, L-2]：掩码
         B, L0, _ = pos.shape    # L0 = 原子数
         
-        #  原子 token 嵌入
-        atom_src = self.tok_emb(src)        # [B, L0, d_model]
-        atom_fea = self.atom_fea_encoder(src)         # [B, L0, d_model]
-        # --- Cross‑Attention 融合 ---
-        # 把 atom_src 当 query，把 atom_fea 当 key/value
-        fused, _ = self.cross_attn(
-            query=atom_src, 
-            key=atom_fea, 
-            value=atom_fea, 
-            key_padding_mask=mask
-        )                                         # [B, L0, d_model]
-        '''
-        # 1) 残差+归一化
-        x = self.cross_norm1(atom_src + self.cross_dropout1(fused))
-        # 2) FFN 残差块
-        x2 = self.cross_ffn(x)
-        src_emb = self.cross_norm2(x + self.cross_dropout2(x2))
-        '''
-        # 残差相加
-        src_emb = atom_src + fused                # [B, L0, d_model]
-        #  计算相对特征（使用周期性边界条件）
+        # 3. 原子 token 嵌入
+        src_data = self.tok_emb(src)        # [B, L0, d_model/2]
+        atom_fea = self.atom_fea_encoder(src)         # [B, L0, d_model/2]
+        atom_src = torch.cat([src_data, atom_fea], dim=-1)  # [B, L0, d_model]
+        
+        # 4. 计算相对特征（使用周期性边界条件）
+        #distances = compute_relative_features_pbc(pos, lattice)  # [B, L0, L0]
         distances = compute_relative_features(pos, lattice, mask)  # [B, L0, L0]
         rel_features = self.rbf_encoder(distances)  # [B, L0, L0, num_centers]
         '''
         import pdb; pdb.set_trace()
         '''
 
-        #  编码器：包含 global token 的输入序列
+        # 5. 编码器：包含 global token 的输入序列
         memory = self.encoder(
-            src=src_emb,
+            src=atom_src,
             src_key_padding_mask=mask,
             pos=pos,
             rel_features=rel_features
         )  # [B, L0, d_model]
         
-        #  解码器：使用 memory 作为上下文进行预测
+        # 6. 解码器：使用 memory 作为上下文进行预测
         query_embed = self.query_embed.unsqueeze(0).repeat(B, 1, 1)  # [B, dos_num, d_model]
         tgt = self.tgt.unsqueeze(0).repeat(B, 1, 1)                  # [B, dos_num, d_model]
         hs, attention_v = self.decoder(
@@ -182,7 +161,7 @@ class Transformer(nn.Module):
             query_pos=query_embed
         )
         
-        #  输出：经过 CNN decoder 得到 DOS 序列
+        # 7. 输出：经过 CNN decoder 得到 DOS 序列
         hs = hs.permute(0, 2, 1)         # [B, d_model, dos_num]
         res = self.out_embed(hs)         # [B, 1, dos_num]
         res = res.permute(0, 2, 1)       # [B, dos_num, 1]
@@ -230,7 +209,6 @@ class TransformerDecoder(nn.Module):
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None):
         output = tgt
-        intermediate = []
 
         for layer in self.layers:
             output, attention = layer(output, memory, tgt_mask=tgt_mask,
@@ -252,8 +230,7 @@ class TransformerEncoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.dim = d_model
         self.nhead = nhead
-        #self.alpha = nn.Parameter(torch.tensor(0.5))  # 学习一个可调整的比例参数
-        # 标准多头自注意力
+        
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         
         # 用于前馈网络
@@ -268,14 +245,8 @@ class TransformerEncoderLayer(nn.Module):
         
         # 保存 RBF 编码器，用于获取相对特征的维度信息
         self.rbf_encoder = rbf_encoder
-        #self.alpha = nn.Parameter(torch.tensor(0.5))  # 默认比例 0.5
-        # 新增：将相对特征映射到与查询向量相同的维度（或者一个合理的中间维度），
-        # 然后再根据头数分解，用于修正注意力打分
         self.rel_proj = nn.Linear(self.rbf_encoder.num_centers, d_model)
-    '''
-    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
-        return tensor if pos is None else tensor + pos
-    '''    
+        self.alpha_rel = nn.Parameter(torch.tensor(1.0))
 
     def forward_post(self, src, src_mask: Optional[torch.Tensor] = None,
                      src_key_padding_mask: Optional[torch.Tensor] = None,
@@ -287,51 +258,37 @@ class TransformerEncoderLayer(nn.Module):
             rel_features: [B, L, L, num_centers]，预计算的 RBF 编码
         """
         B, L, _ = src.size()
-        
-        # 计算查询、键、值
         q, k, v = src, src, src
-        
-        # 标准多头注意力的点积部分
         attn_output, attn_weights = self.self_attn(q, k, v, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
         
-        # 如果有相对特征，将其映射并整合到打分中
-        if rel_features is not None:
-            # 将相对特征映射到 d_model 维度，再 reshape 为 [B, L, L, nhead, d_model_head]
-            # 其中 d_model_head = d_model // nhead
-            rel_emb = self.rel_proj(rel_features)  # [B, L, L, d_model]
-            d_model_head = self.dim // self.nhead
-            rel_emb = rel_emb.view(B, L, L, self.nhead, d_model_head)
-            
-            # 将查询拆分为多个头：[B, L, nhead, d_model_head]
-            q_heads = q.view(B, L, self.nhead, d_model_head)
-            
-            # 计算额外的相对打分：点积 q_heads 和 rel_emb 的最后一维
-            # 得到 [B, L, L, nhead]
-            rel_scores = (q_heads.unsqueeze(2) * rel_emb).sum(-1)
-            
-            # 将 rel_scores 转换为形状 [B * nhead, L, L]，与标准注意力分数相加
-            rel_scores = rel_scores.permute(0, 3, 1, 2).reshape(B * self.nhead, L, L)
-            
-            # 重新计算标准注意力打分（这里假设已经进行了缩放处理），并加上 rel_scores
-            # 这里我们直接模拟一个加法操作，实际中可能需要调整比例因子
-            # 获取标准自注意力的打分（未经过 softmax 的部分）：
-            q_scaled = q / (self.dim ** 0.5)
-            q_heads2 = q_scaled.view(B, L, self.nhead, d_model_head).permute(0, 2, 1, 3).reshape(B * self.nhead, L, d_model_head)
-            k_heads = k.view(B, L, self.nhead, d_model_head).permute(0, 2, 1, 3).reshape(B * self.nhead, L, d_model_head)
-            base_scores = torch.bmm(q_heads2, k_heads.transpose(1, 2))
-            
-            # 新的总打分
-            total_scores = base_scores + rel_scores
 
-            # 计算新的注意力权重并输出
+        if rel_features is not None:
+            
+            # 1) 映射相对特征
+            rel_emb = self.rel_proj(rel_features)  # [B, L, L, d_model]
+            d_k = self.dim // self.nhead
+            rel_emb = rel_emb.view(B, L, L, self.nhead, d_k)
+            
+            # 2) 拆头
+            q_heads = q.view(B, L, self.nhead, d_k)
+            
+            # 3) 计算 rel_scores
+            rel_scores = (q_heads.unsqueeze(2) * rel_emb).sum(-1)  # [B, L, L, nhead]
+            rel_scores = rel_scores.permute(0,3,1,2).reshape(B*self.nhead, L, L)
+ 
+            # 4) 重算 base_scores 并对两部分都做 √d_k 缩放
+            q_heads2 = q.view(B, L, self.nhead, d_k).permute(0,2,1,3).reshape(B*self.nhead, L, d_k)
+            k_heads  = k.view(B, L, self.nhead, d_k).permute(0,2,1,3).reshape(B*self.nhead, L, d_k)
+            base_scores = torch.bmm(q_heads2, k_heads.transpose(1,2)) / math.sqrt(d_k)
+            rel_scores  = (self.alpha_rel * rel_scores) / math.sqrt(d_k)
+            alpha = self.alpha_rel
+            total_scores = (base_scores + alpha * rel_scores) / math.sqrt(1.0 + alpha * alpha)
+
+            # 5) softmax + 重算 attention output
             attn_weights_new = F.softmax(total_scores, dim=-1)
-            
-            # 重新计算注意力输出：将新的权重作用于 v（同样需要拆分成头）
-            v_heads = v.view(B, L, self.nhead, d_model_head).permute(0, 2, 1, 3).reshape(B * self.nhead, L, d_model_head)
+            v_heads = v.view(B, L, self.nhead, d_k).permute(0, 2, 1, 3).reshape(B * self.nhead, L, d_k)
             attn_output_new = torch.bmm(attn_weights_new, v_heads)
-            attn_output_new = attn_output_new.view(B, self.nhead, L, d_model_head).permute(0, 2, 1, 3).reshape(B, L, self.dim)
-            
-            # 使用新的注意力输出
+            attn_output_new = attn_output_new.view(B, self.nhead, L, d_k).permute(0, 2, 1, 3).reshape(B, L, self.dim)
             src2 = attn_output_new
         else:
             src2 = attn_output
@@ -375,11 +332,14 @@ class TransformerDecoderLayer(nn.Module):
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None):
-        tgt2 = self.self_attn(tgt, tgt, value=tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
+        q = tgt
+        k = tgt
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-
-        tgt2, attention_v = self.multihead_attn(query=tgt, key=memory, value=memory,
+        q = tgt
+        k = memory
+        tgt2, attention_v = self.multihead_attn(query=q, key=k, value=memory,
                                                 attn_mask=memory_mask,
                                                 key_padding_mask=memory_key_padding_mask)
         tgt = tgt + self.dropout2(tgt2)
