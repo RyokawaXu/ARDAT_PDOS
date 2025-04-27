@@ -88,8 +88,16 @@ class Transformer(nn.Module):
 
         self.query_embed = nn.Parameter(torch.zeros(dos_num, d_model))
         self.tgt = nn.Parameter(torch.zeros(dos_num, d_model))
-        self.tok_emb = nn.Embedding(token_num, d_model//2)
-        
+        self.tok_emb = nn.Embedding(token_num, d_model)
+        #新增：cross‑attention 层
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead,
+                                                dropout=dropout,
+                                                batch_first=True)
+        self.cross_norm1 = nn.LayerNorm(d_model)
+        self.cross_dropout1 = nn.Dropout(0.1)
+        self.cross_ffn = MLP(d_model, d_model, d_model, num_layers=2)
+        self.cross_norm2 = nn.LayerNorm(d_model)
+        self.cross_dropout2 = nn.Dropout(0.1)
         #self.out_embed = MLP(d_model, d_model, 1, 5)
         self.out_embed = CNN(d_model, d_model*3, output_dim=1, num_layers=4)
         #self.out_embed = nn.Sequential(
@@ -102,7 +110,7 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
 
-        self.atom_fea_encoder = AtomFeatureEncoder(3, d_model//2)
+        self.atom_fea_encoder = AtomFeatureEncoder(3, d_model)
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -130,9 +138,26 @@ class Transformer(nn.Module):
         B, L0, _ = pos.shape    # L0 = 原子数
         
         # 3. 原子 token 嵌入
-        src_data = self.tok_emb(src)        # [B, L0, d_model/2]
-        atom_fea = self.atom_fea_encoder(src)         # [B, L0, d_model/2]
-        atom_src = torch.cat([src_data, atom_fea], dim=-1)  # [B, L0, d_model]
+        #  原子 token 嵌入
+        atom_src = self.tok_emb(src)        # [B, L0, d_model]
+        atom_fea = self.atom_fea_encoder(src)         # [B, L0, d_model]
+        # --- Cross‑Attention 融合 ---
+        # 把 atom_src 当 query，把 atom_fea 当 key/value
+        fused, _ = self.cross_attn(
+            query=atom_src, 
+            key=atom_fea, 
+            value=atom_fea, 
+            key_padding_mask=mask
+        )                                         # [B, L0, d_model]
+        '''
+        # 1) 残差+归一化
+        x = self.cross_norm1(atom_src + self.cross_dropout1(fused))
+        # 2) FFN 残差块
+        x2 = self.cross_ffn(x)
+        src_emb = self.cross_norm2(x + self.cross_dropout2(x2))
+        '''
+        # 残差相加
+        src_emb = atom_src + fused                # [B, L0, d_model]
         
         # 4. 计算相对特征（使用周期性边界条件）
         #distances = compute_relative_features_pbc(pos, lattice)  # [B, L0, L0]
@@ -144,7 +169,7 @@ class Transformer(nn.Module):
 
         # 5. 编码器：包含 global token 的输入序列
         memory = self.encoder(
-            src=atom_src,
+            src=src_emb,
             src_key_padding_mask=mask,
             pos=pos,
             rel_features=rel_features
