@@ -30,9 +30,9 @@ src_len = 128
 
 tgt_len = 64
 
-filename1 = "elements_apet.csv"
-filename2 = "positions_apet.csv"
-filename3  = "tgtdos_apet.csv"
+filename1 = "elements.csv"
+filename2 = "positions.csv"
+filename3  = "tgtdos.csv"
 
 
 
